@@ -159,7 +159,7 @@ func mkNetwork(node string) (D, error) {
 	}
 
 	// add access
-	err = R("wg.conf").Redirect(
+	err = R("/etc/wireguard/miniotest.conf").Redirect(
 		tfuser(
 			"gen",
 			"--schema", schema,
@@ -182,21 +182,20 @@ func mkNetwork(node string) (D, error) {
 	}
 
 	d := D(func() {
-		log.Debug().Msg("de-provision network")
+		log.Debug().Str("resource", resource.ID()).Msg("de-provision network")
 		if err := deProvision(resource); err != nil {
 			log.Error().Err(err).Msg("failed to de-provision network")
 		}
-		//TODO de-provision network
 	})
 
-	wg, err := cmd("wg-quick", "up", "wg.conf")
+	wg, err := cmd("wg-quick", "up", "miniotest")
 	fmt.Println(wg)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to bring wg interface up: %s", wg)
+		return d, errors.Wrapf(err, "failed to bring wg interface up: %s", wg)
 	}
 
 	d = d.Then(func() {
-		if _, err := cmd("wq-quick", "down", "wg.conf"); err != nil {
+		if _, err := cmd("wg-quick", "down", "miniotest"); err != nil {
 			log.Error().Err(err).Msg("failed to clean up wireguard setup")
 		}
 	})
