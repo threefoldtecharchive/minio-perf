@@ -490,7 +490,7 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to execute tests")
 	}
 	/*
-		TODO:
+		Process:
 		 - Make a new user
 		 - We first to need to know which node we need to test. do the following
 		  = Deploy a network on that remote node
