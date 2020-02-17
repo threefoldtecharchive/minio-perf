@@ -469,12 +469,11 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to get a temporary root directory")
 	}
 
-	//TODO: uncomment after debugging
-	// defer func() {
-	// 	if err := os.RemoveAll(root); err != nil {
-	// 		log.Error().Err(err).Str("root", root).Msg("failed to clean up test root")
-	// 	}
-	// }()
+	defer func() {
+		if err := os.RemoveAll(root); err != nil {
+			log.Error().Err(err).Str("root", root).Msg("failed to clean up test root")
+		}
+	}()
 
 	if cwd, err := os.Getwd(); err == nil {
 		defer os.Chdir(cwd)
