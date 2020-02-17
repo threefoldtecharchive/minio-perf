@@ -1,11 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,6 +18,17 @@ import (
 const (
 	// ProvisionDuration time set for all the test reservation
 	ProvisionDuration = "1h"
+	//ExplorerURL endpoint
+	ExplorerURL = "https://explorer.devnet.grid.tf/"
+
+	// NetworkName network name
+	NetworkName = "minio"
+	//Network full range
+	Network = "172.10.0.0/16"
+	// Subnet network subnet
+	Subnet = "172.10.1.0/24"
+	// MinioIP value
+	MinioIP = "172.10.1.100"
 )
 
 var (
@@ -33,97 +44,8 @@ func init() {
 
 }
 
-// R is a utility to quickly write output of tfuser command to a file
-type R string
-
-// Redirect usually called like Redirect(tfuser(...))
-func (o R) Redirect(s string, err error) error {
-	if err != nil {
-		return err
-	}
-
-	return ioutil.WriteFile(string(o), []byte(s), 0644)
-}
-
-// D is an alias for func() to be used as clean up method
-// usually as `defer d.Defer()`
-type D func()
-
-// Defer runs this D object, does nothing if d is nil
-func (d D) Defer() {
-	if d != nil {
-		d()
-	}
-}
-
-// Then return a new D that when called first calls d, then n
-func (d D) Then(n D) D {
-	return func() {
-		d.Defer()
-		n.Defer()
-	}
-}
-
-func cmd(c string, args ...string) (string, error) {
-	out, err := exec.Command(c, args...).Output()
-	if err != nil {
-		return "", err
-	}
-
-	return string(out), nil
-}
-
-func tfuser(args ...string) (string, error) {
-	return cmd(TFUser, args...)
-}
-
 func mkUser() error {
 	_, err := tfuser("id")
-	return err
-}
-
-// Resource represents a resource URI
-type Resource string
-
-// ID return resource ID
-func (r Resource) ID() string {
-	return filepath.Base(string(r))
-}
-
-func provision(schema, node string) (Resource, error) {
-
-	// provision network
-	out, err := tfuser(
-		"provision",
-		"--schema", schema,
-		"--duration", ProvisionDuration,
-		"--seed", "user.seed",
-		"--node", node,
-	)
-	if err != nil {
-		return "", errors.Wrapf(err, "failed to provision '%s'", schema)
-	}
-
-	const (
-		prefix = "Resource: "
-	)
-
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.HasPrefix(line, prefix) {
-			continue
-		}
-
-		return Resource(strings.TrimPrefix(line, prefix)), nil
-	}
-
-	return "", fmt.Errorf("failed to extract resource URI from reservation (%s):\n%s", schema, out)
-}
-
-func deProvision(r Resource) error {
-	_, err := tfuser(
-		"delete",
-		"--id", r.ID(),
-	)
 	return err
 }
 
@@ -136,8 +58,8 @@ func mkNetwork(node string) (D, error) {
 		"gen",
 		"network",
 		"create",
-		"--name", "minio",
-		"--cidr", "172.10.0.0/16",
+		"--name", NetworkName,
+		"--cidr", Network,
 	))
 
 	if err != nil {
@@ -151,7 +73,7 @@ func mkNetwork(node string) (D, error) {
 		"network",
 		"add-node",
 		"--node", node,
-		"--subnet", "172.10.1.0/24",
+		"--subnet", Subnet,
 	)
 
 	if err != nil {
@@ -203,6 +125,164 @@ func mkNetwork(node string) (D, error) {
 	return d, nil
 }
 
+// ZDB result object
+type ZDB struct {
+	Namespace string `json:"Namespace"`
+	IP        string `json:"IP"`
+	Port      int    `json:"Port"`
+	Password  string `json:"-"`
+}
+
+// Resource return the resource associated with this zdb
+func (z *ZDB) Resource() Resource {
+	return Resource(filepath.Join("reservations", z.Namespace))
+}
+
+func (z *ZDB) String() string {
+	return fmt.Sprintf("%s:%s@[%s]:%d", z.Namespace, z.Password, z.IP, z.Port)
+}
+
+// ZDBs alias for []ZDB
+type ZDBs []ZDB
+
+// Clean clean zdbs
+func (zs ZDBs) Clean() {
+	for _, zdb := range zs {
+		if err := deProvision(zdb.Resource()); err != nil {
+			log.Error().Err(err).Str("reservation", zdb.Resource().ID()).Msg("failed to delete reservation")
+		}
+	}
+}
+
+func (zs ZDBs) String() string {
+	var buf strings.Builder
+	for _, z := range zs {
+		if buf.Len() != 0 {
+			buf.WriteByte(',')
+		}
+		buf.WriteString(z.String())
+	}
+
+	return buf.String()
+}
+
+func mkZdb(n int) (zdbs ZDBs, err error) {
+	cl := MustExplorer(ExplorerURL)
+	nodes, err := cl.Nodes(IsUp(), WithSRU(10))
+
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to list nodes from explorer")
+	}
+	if len(nodes) < n {
+		return nil, fmt.Errorf("number of online nodes is not sufficient (required at least: %d", n)
+	}
+
+	const (
+		password = "password"
+	)
+
+	err = R("zdb.json").Redirect(
+		tfuser(
+			"generate",
+			"storage",
+			"zdb",
+			"--size", "10",
+			"--type", "SSD",
+			"--mode", "seq",
+			"--password", password,
+		),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	Shuffle(nodes)
+
+	var resources []Resource
+
+	defer func() {
+		if err != nil {
+			deProvision(resources...)
+		}
+	}()
+
+	for i := 0; i < n; i++ {
+		var resource Resource
+		resource, err = provision("zdb.json", nodes[i].ID)
+		if err != nil {
+			return nil, err
+		}
+
+		resources = append(resources, resource)
+	}
+
+	results, err := cl.Wait(resources...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, result := range results {
+		if result.State != "ok" {
+			err = fmt.Errorf("reservation '%s' has status: %s", result.ID, result.State)
+			return
+		}
+
+		var zdb ZDB
+		if err = json.Unmarshal(result.Data, &zdb); err != nil {
+			return nil, err
+		}
+		zdb.Password = password
+		zdbs = append(zdbs, zdb)
+	}
+
+	// TODO: wait for resources to finish deployment
+	return zdbs, nil
+}
+
+func mkMinio(node string, zdbs ZDBs) (D, error) {
+	const (
+		flist = "https://hub.grid.tf/azmy.3bot/minio.flist"
+	)
+
+	R("container.json").Redirect(
+		tfuser(
+			"generate",
+			"container",
+			"--flist", flist,
+			"--entrypoint", "/bin/entrypoint",
+			"--envs", fmt.Sprintf("SHARDS=%s", zdbs.String()),
+			"--envs", "DATA=2",
+			"--envs", "PARITY=1",
+			"--envs", "ACCESS_KEY=minio",
+			"--envs", "SECRET_KEY=passwordpassword",
+			"--cpu", "2",
+			"--memory", "4096",
+			"--ip", MinioIP,
+		),
+	)
+
+	resource, err := provision("container.json", node)
+	if err != nil {
+		return nil, err
+	}
+
+	d := D(func() {
+		if err := deProvision(resource); err != nil {
+			log.Error().Err(err).Msg("failed to de-provision minio container")
+		}
+	})
+
+	cl := MustExplorer(ExplorerURL)
+	_, err = cl.Wait(resource)
+	if err != nil {
+		d.Defer()
+		return nil, err
+	}
+
+	return d, nil
+}
+
 func run(node string) error {
 	// - Make use seed file.
 	if err := mkUser(); err != nil {
@@ -217,7 +297,73 @@ func run(node string) error {
 
 	defer dNetwork.Defer()
 
+	zdbs, err := mkZdb(3)
+	if err != nil {
+		return errors.Wrap(err, "failed to deploy zdbs")
+	}
+
+	defer zdbs.Clean()
+
+	for _, zdb := range zdbs {
+		fmt.Println(zdb.String())
+	}
+
+	dMinio, err := mkMinio(node, zdbs)
+	if err != nil {
+		return errors.Wrap(err, "failed to deploy minio")
+	}
+	defer dMinio.Defer()
+
+	fmt.Println("exit with no clean up")
+	os.Exit(0)
+	// Now deploy the minio container
 	return nil
+}
+
+func test() {
+	const (
+		flist = "https://hub.grid.tf/azmy.3bot/minio.flist"
+	)
+
+	zdbs := ZDBs{
+		{Namespace: "ns1", IP: "192.168.1.1", Port: 1234, Password: "password"},
+		{Namespace: "ns2", IP: "192.168.1.2", Port: 5467, Password: "password"},
+	}
+	TFUser = "/home/azmy/tmp/tfuser"
+
+	err := R("container.json").Redirect(
+		tfuser(
+			"generate",
+			"container",
+			"--flist", flist,
+			"--entrypoint", "/bin/entrypoint",
+			"--envs", fmt.Sprintf("SHARDS=%s", zdbs.String()),
+			"--envs", "DATA=2",
+			"--envs", "PARITY=1",
+			"--envs", "ACCESS_KEY=minio",
+			"--envs", "SECRET_KEY=passwordpassword",
+			"--cpu", "2",
+			"--memory", "4096",
+		),
+	)
+
+	if err != nil {
+		panic(err)
+	}
+	// cl, err := NewExplorer("https://explorer.devnet.grid.tf/")
+	// if err != nil {
+	// 	panic(err)
+	// }
+
+	// nodes, err := cl.Nodes(IsUp())
+	// if err != nil {
+	// 	panic(err)
+	// }
+	// enc := json.NewEncoder(os.Stdout)
+	// enc.SetIndent("", "  ")
+	// enc.Encode(nodes)
+
+	// fmt.Println("Nodes:", len(nodes))
 }
 
 func main() {
