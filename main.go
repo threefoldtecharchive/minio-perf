@@ -394,28 +394,48 @@ func test() error {
 }
 
 func uploadTest(config, bucket string, size int64) error {
-	hash, path, err := mkTestFile(size)
+	hash, name, err := mkTestFile(size)
 	if err != nil {
 		return err
 	}
 
-	log := log.With().Int64("size-mb", size).Str("file", path).Str("hash", fmt.Sprintf("%x", hash)).Logger()
+	log := log.With().Int64("size-mb", size).Str("file", name).Str("hash", hash).Logger()
 	log.Info().Msg("uploading file")
 
 	dur, err := mc(
 		"-C", config,
-		"cp", path, bucket,
+		"cp", name, bucket,
 	)
 
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "failed to upload file: %s", name)
 	}
 
 	log.Info().Str("duration", dur.String()).Msg("uploading time")
 
-	// TODO:
-	// - download file
-	// - check hash
+	downloadName := fmt.Sprintf("%s.download", name)
+	dur, err = mc(
+		"-C", config,
+		"cp", filepath.Join(bucket, name), downloadName,
+	)
+
+	if err != nil {
+		return errors.Wrapf(err, "failed to download file: %s", name)
+	}
+
+	log.Info().Str("duration", dur.String()).Msg("downloading time")
+
+	downloadHash, err := md5sum(downloadName)
+	if err != nil {
+		return errors.Wrapf(err, "failed to md5sum of file: %s", downloadName)
+	}
+
+	if downloadHash != hash {
+		log.Warn().Str("destination", downloadName).Str("download-hash", downloadHash).Msg("hash does not match")
+	} else {
+		log.Info().Str("destination", downloadName).Msg("hash matches")
+	}
+
 	return nil
 }
 

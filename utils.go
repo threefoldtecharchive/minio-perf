@@ -99,7 +99,7 @@ func deProvision(rs ...Resource) error {
 	return nil
 }
 
-func mkTestFile(sizeMB int64) (hash []byte, path string, err error) {
+func mkTestFile(sizeMB int64) (hash string, path string, err error) {
 	file, err := ioutil.TempFile(".", fmt.Sprintf("random-%dMB-", sizeMB))
 	if err != nil {
 		return hash, path, err
@@ -108,5 +108,15 @@ func mkTestFile(sizeMB int64) (hash []byte, path string, err error) {
 	output := io.MultiWriter(file, hasher)
 	defer file.Close()
 	_, err = io.CopyN(output, rand.Reader, sizeMB*1024*1024)
-	return hasher.Sum(nil), file.Name(), err
+	return fmt.Sprintf("%x", hasher.Sum(nil)), file.Name(), err
+}
+
+func md5sum(name string) (string, error) {
+	out, err := cmd("md5sum", name)
+	if err != nil {
+		return "", err
+	}
+
+	fields := strings.Fields(strings.TrimSpace(out))
+	return fields[0], nil
 }
