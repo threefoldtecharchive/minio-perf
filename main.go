@@ -317,7 +317,7 @@ func run(node string) error {
 	return test()
 }
 
-func mc(args ...string) error {
+func mc(args ...string) (time.Duration, error) {
 	notify := func(err error, d time.Duration) {
 		log.Info().Err(err).Dur("duration", d).Msg(strings.Join(args, " "))
 	}
@@ -325,14 +325,21 @@ func mc(args ...string) error {
 	exp := backoff.NewExponentialBackOff()
 	exp.MaxInterval = 10 * time.Second
 	boff := backoff.WithMaxRetries(exp, 10)
-
-	return backoff.RetryNotify(func() error {
+	var d time.Duration
+	err := backoff.RetryNotify(func() error {
 		cmd := exec.Command(MCBin, args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 
-		return cmd.Run()
+		t := time.Now()
+
+		err := cmd.Run()
+		d = time.Since(t)
+		return err
+
 	}, boff, notify)
+
+	return d, err
 }
 
 func test() error {
@@ -366,25 +373,50 @@ func test() error {
 		bucket = "test/bucket"
 	)
 
-	if err := mc("-C", configDir, "mb", bucket); err != nil {
+	if _, err := mc("-C", configDir, "mb", bucket); err != nil {
 		return err
 	}
 
-	h10m, p10m, err := mkTestFile(10)
+	if err := uploadTest(configDir, bucket, 10); err != nil {
+		log.Error().Err(err).Msg("error while testing 10mb file upload")
+	}
+
+	if err := uploadTest(configDir, bucket, 100); err != nil {
+		log.Error().Err(err).Msg("error while testing 100mb file upload")
+	}
+
+	if err := uploadTest(configDir, bucket, 1024); err != nil {
+		log.Error().Err(err).Msg("error while testing 1024mb file upload")
+	}
+
+	_, err := mc("-C", configDir, "ls", bucket)
+	return err
+}
+
+func uploadTest(config, bucket string, size int64) error {
+	hash, path, err := mkTestFile(size)
 	if err != nil {
 		return err
 	}
 
-	log.Debug().Str("file", p10m).Str("hash", fmt.Sprintf("%x", h10m)).Msg("uploading file")
+	log := log.With().Int64("size-mb", size).Str("file", path).Str("hash", fmt.Sprintf("%x", hash)).Logger()
+	log.Info().Msg("uploading file")
 
-	if err := mc(
-		"-C", configDir,
-		"cp", p10m, bucket,
-	); err != nil {
+	dur, err := mc(
+		"-C", config,
+		"cp", path, bucket,
+	)
+
+	if err != nil {
 		return err
 	}
 
-	return mc("-C", configDir, "ls", bucket)
+	log.Info().Str("duration", dur.String()).Msg("uploading time")
+
+	// TODO:
+	// - download file
+	// - check hash
+	return nil
 }
 
 func main() {
