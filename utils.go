@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/md5"
+	"crypto/rand"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os/exec"
 	"strings"
@@ -43,14 +46,14 @@ func (d D) Then(n D) D {
 func cmd(c string, args ...string) (string, error) {
 	out, err := exec.Command(c, args...).Output()
 	if err != nil {
-		return "", err
+		return string(out), err
 	}
 
 	return string(out), nil
 }
 
 func tfuser(args ...string) (string, error) {
-	return cmd(TFUser, args...)
+	return cmd(TFUserBin, args...)
 }
 
 func provision(schema, node string) (Resource, error) {
@@ -94,4 +97,16 @@ func deProvision(rs ...Resource) error {
 	}
 
 	return nil
+}
+
+func mkTestFile(sizeMB int64) (hash []byte, path string, err error) {
+	file, err := ioutil.TempFile(".", fmt.Sprintf("random-%dMB-", sizeMB))
+	if err != nil {
+		return hash, path, err
+	}
+	hasher := md5.New()
+	output := io.MultiWriter(file, hasher)
+	defer file.Close()
+	_, err = io.CopyN(output, rand.Reader, sizeMB*1024*1024)
+	return hasher.Sum(nil), file.Name(), err
 }

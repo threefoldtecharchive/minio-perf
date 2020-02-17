@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v3"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -32,8 +34,10 @@ const (
 )
 
 var (
-	// TFUser binary
-	TFUser string = "tfuser"
+	// TFUserBin binary
+	TFUserBin string = "tfuser"
+	// MCBin binary
+	MCBin string = "mc"
 )
 
 func init() {
@@ -111,7 +115,6 @@ func mkNetwork(node string) (D, error) {
 	})
 
 	wg, err := cmd("wg-quick", "up", "miniotest")
-	fmt.Println(wg)
 	if err != nil {
 		return d, errors.Wrapf(err, "failed to bring wg interface up: %s", wg)
 	}
@@ -259,6 +262,7 @@ func mkMinio(node string, zdbs ZDBs) (D, error) {
 			"--cpu", "2",
 			"--memory", "4096",
 			"--ip", MinioIP,
+			"--network", NetworkName,
 		),
 	)
 
@@ -304,81 +308,104 @@ func run(node string) error {
 
 	defer zdbs.Clean()
 
-	for _, zdb := range zdbs {
-		fmt.Println(zdb.String())
-	}
-
 	dMinio, err := mkMinio(node, zdbs)
 	if err != nil {
 		return errors.Wrap(err, "failed to deploy minio")
 	}
 	defer dMinio.Defer()
 
-	fmt.Println("exit with no clean up")
-	os.Exit(0)
-	// Now deploy the minio container
-	return nil
+	return test()
 }
 
-func test() {
+func mc(args ...string) error {
+	notify := func(err error, d time.Duration) {
+		log.Info().Err(err).Dur("duration", d).Msg(strings.Join(args, " "))
+	}
+
+	exp := backoff.NewExponentialBackOff()
+	exp.MaxInterval = 10 * time.Second
+	boff := backoff.WithMaxRetries(exp, 10)
+
+	return backoff.RetryNotify(func() error {
+		cmd := exec.Command(MCBin, args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		return cmd.Run()
+	}, boff, notify)
+}
+
+func test() error {
 	const (
-		flist = "https://hub.grid.tf/azmy.3bot/minio.flist"
+		configDir = "mc"
 	)
-
-	zdbs := ZDBs{
-		{Namespace: "ns1", IP: "192.168.1.1", Port: 1234, Password: "password"},
-		{Namespace: "ns2", IP: "192.168.1.2", Port: 5467, Password: "password"},
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return err
 	}
-	TFUser = "/home/azmy/tmp/tfuser"
+	config := `{
+	"version": "9",
+	"hosts": {
+		"test": {
+			"url": "http://%s:9000",
+			"accessKey": "minio",
+			"secretKey": "passwordpassword",
+			"api": "s3v4",
+			"lookup": "auto"
+		}
+	}
+}
+`
 
-	err := R("container.json").Redirect(
-		tfuser(
-			"generate",
-			"container",
-			"--flist", flist,
-			"--entrypoint", "/bin/entrypoint",
-			"--envs", fmt.Sprintf("SHARDS=%s", zdbs.String()),
-			"--envs", "DATA=2",
-			"--envs", "PARITY=1",
-			"--envs", "ACCESS_KEY=minio",
-			"--envs", "SECRET_KEY=passwordpassword",
-			"--cpu", "2",
-			"--memory", "4096",
-		),
+	config = fmt.Sprintf(config, MinioIP)
+
+	if err := ioutil.WriteFile("mc/config.json", []byte(config), 0644); err != nil {
+		return err
+	}
+
+	const (
+		bucket = "test/bucket"
 	)
 
+	if err := mc("-C", configDir, "mb", bucket); err != nil {
+		return err
+	}
+
+	h10m, p10m, err := mkTestFile(10)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	// cl, err := NewExplorer("https://explorer.devnet.grid.tf/")
-	// if err != nil {
-	// 	panic(err)
-	// }
 
-	// nodes, err := cl.Nodes(IsUp())
-	// if err != nil {
-	// 	panic(err)
-	// }
-	// enc := json.NewEncoder(os.Stdout)
-	// enc.SetIndent("", "  ")
-	// enc.Encode(nodes)
+	log.Debug().Str("file", p10m).Str("hash", fmt.Sprintf("%x", h10m)).Msg("uploading file")
 
-	// fmt.Println("Nodes:", len(nodes))
+	if err := mc(
+		"-C", configDir,
+		"cp", p10m, bucket,
+	); err != nil {
+		return err
+	}
+
+	return mc("-C", configDir, "ls", bucket)
 }
 
 func main() {
 	var (
-		bin  string
-		node string
+		tfBin string
+		mcBin string
+		node  string
 	)
 
-	flag.StringVar(&bin, "tfuser", "", "path to tfuser binary. Default to using $PATH")
+	flag.StringVar(&tfBin, "tfuser", "", "path to tfuser binary. Default to using $PATH")
+	flag.StringVar(&mcBin, "mc", "", "path to mc binary. Default to using $PATH")
 	flag.StringVar(&node, "node", "", "node to install minio. It must have public interface")
 
 	flag.Parse()
 
-	if len(bin) != 0 {
-		TFUser, _ = filepath.Abs(bin)
+	if len(tfBin) != 0 {
+		TFUserBin, _ = filepath.Abs(tfBin)
+	}
+
+	if len(mcBin) != 0 {
+		MCBin, _ = filepath.Abs(mcBin)
 	}
 
 	if len(node) == 0 {
