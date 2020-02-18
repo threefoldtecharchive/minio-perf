@@ -392,10 +392,10 @@ func test() ([]Statistics, error) {
 }
 
 type Statistics struct {
-	HashMatch bool  `json:"hash-match"`
-	Size      int64 `json:"size-mb"`
-	Upload    time.Duration
-	Download  time.Duration
+	HashMatch bool          `json:"hash-match"`
+	Size      int64         `json:"size-mb"`
+	Upload    time.Duration `json:"upload-ns"`
+	Download  time.Duration `json:"download-ns"`
 }
 
 func uploadTest(config, bucket string, size int64) (*Statistics, error) {
@@ -545,6 +545,5 @@ func main() {
 	enc := json.NewEncoder(output)
 	for _, st := range stats {
 		enc.Encode(st)
-		output.WriteString("\n")
 	}
 }
