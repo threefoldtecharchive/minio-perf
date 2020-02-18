@@ -22,6 +22,9 @@ func (r Resource) ID() string {
 	return filepath.Base(string(r))
 }
 
+// PublicConfig struct
+type PublicConfig struct{}
+
 // Node represents a grid node
 type Node struct {
 	ID        string `json:"node_id"`
@@ -29,6 +32,7 @@ type Node struct {
 	Resources struct {
 		SRU int `json:"sru"`
 	} `json:"total_resources"`
+	PublicConfig *PublicConfig `json:"public_config,omitempty"`
 }
 
 // Result struct
@@ -167,6 +171,13 @@ func IsUp() Filter {
 	return func(n *Node) bool {
 		now := time.Now()
 		return (now.Unix() - n.Updated) < 10*60
+	}
+}
+
+//IsPublic return nodes that has public interface
+func IsPublic() Filter {
+	return func(n *Node) bool {
+		return n.PublicConfig != nil
 	}
 }
 

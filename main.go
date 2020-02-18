@@ -287,31 +287,32 @@ func mkMinio(node string, zdbs ZDBs) (D, error) {
 	return d, nil
 }
 
-func run(node string) error {
+func run(node string) ([]Statistics, error) {
 	// - Make use seed file.
 	if err := mkUser(); err != nil {
-		return errors.Wrap(err, "failed to create user")
+		return nil, errors.Wrap(err, "failed to create user")
 	}
 
 	// - Make network and provision it.
 	dNetwork, err := mkNetwork(node)
 	if err != nil {
-		return errors.Wrap(err, "failed to create network")
+		return nil, errors.Wrap(err, "failed to create network")
 	}
 
 	defer dNetwork.Defer()
 
 	zdbs, err := mkZdb(3)
 	if err != nil {
-		return errors.Wrap(err, "failed to deploy zdbs")
+		return nil, errors.Wrap(err, "failed to deploy zdbs")
 	}
 
 	defer zdbs.Clean()
 
 	dMinio, err := mkMinio(node, zdbs)
 	if err != nil {
-		return errors.Wrap(err, "failed to deploy minio")
+		return nil, errors.Wrap(err, "failed to deploy minio")
 	}
+
 	defer dMinio.Defer()
 
 	return test()
@@ -342,12 +343,12 @@ func mc(args ...string) (time.Duration, error) {
 	return d, err
 }
 
-func test() error {
+func test() ([]Statistics, error) {
 	const (
 		configDir = "mc"
 	)
 	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return err
+		return nil, err
 	}
 	config := `{
 	"version": "9",
@@ -366,7 +367,7 @@ func test() error {
 	config = fmt.Sprintf(config, MinioIP)
 
 	if err := ioutil.WriteFile("mc/config.json", []byte(config), 0644); err != nil {
-		return err
+		return nil, err
 	}
 
 	const (
@@ -374,60 +375,64 @@ func test() error {
 	)
 
 	if _, err := mc("-C", configDir, "mb", bucket); err != nil {
-		return err
+		return nil, err
 	}
 
-	if err := uploadTest(configDir, bucket, 10); err != nil {
-		log.Error().Err(err).Msg("error while testing 10mb file upload")
+	var statistics []Statistics
+	for _, size := range []int64{10, 100, 1024} {
+		stats, err := uploadTest(configDir, bucket, size)
+		if err != nil {
+			log.Error().Err(err).Msgf("error while testing %dmb file upload", size)
+		}
+
+		statistics = append(statistics, *stats)
 	}
 
-	if err := uploadTest(configDir, bucket, 100); err != nil {
-		log.Error().Err(err).Msg("error while testing 100mb file upload")
-	}
-
-	if err := uploadTest(configDir, bucket, 1024); err != nil {
-		log.Error().Err(err).Msg("error while testing 1024mb file upload")
-	}
-
-	_, err := mc("-C", configDir, "ls", bucket)
-	return err
+	return statistics, nil
 }
 
-func uploadTest(config, bucket string, size int64) error {
+type Statistics struct {
+	HashMatch bool  `json:"hash-match"`
+	Size      int64 `json:"size-mb"`
+	Upload    time.Duration
+	Download  time.Duration
+}
+
+func uploadTest(config, bucket string, size int64) (*Statistics, error) {
 	hash, name, err := mkTestFile(size)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	log := log.With().Int64("size-mb", size).Str("file", name).Str("hash", hash).Logger()
 	log.Info().Msg("uploading file")
 
-	dur, err := mc(
+	uploadDur, err := mc(
 		"-C", config,
 		"cp", name, bucket,
 	)
 
 	if err != nil {
-		return errors.Wrapf(err, "failed to upload file: %s", name)
+		return nil, errors.Wrapf(err, "failed to upload file: %s", name)
 	}
 
-	log.Info().Str("duration", dur.String()).Msg("uploading time")
+	log.Info().Str("duration", uploadDur.String()).Msg("uploading time")
 
 	downloadName := fmt.Sprintf("%s.download", name)
-	dur, err = mc(
+	downloadDur, err := mc(
 		"-C", config,
 		"cp", filepath.Join(bucket, name), downloadName,
 	)
 
 	if err != nil {
-		return errors.Wrapf(err, "failed to download file: %s", name)
+		return nil, errors.Wrapf(err, "failed to download file: %s", name)
 	}
 
-	log.Info().Str("duration", dur.String()).Msg("downloading time")
+	log.Info().Str("duration", downloadDur.String()).Msg("downloading time")
 
 	downloadHash, err := md5sum(downloadName)
 	if err != nil {
-		return errors.Wrapf(err, "failed to md5sum of file: %s", downloadName)
+		return nil, errors.Wrapf(err, "failed to md5sum of file: %s", downloadName)
 	}
 
 	if downloadHash != hash {
@@ -436,10 +441,43 @@ func uploadTest(config, bucket string, size int64) error {
 		log.Info().Str("destination", downloadName).Msg("hash matches")
 	}
 
-	return nil
+	return &Statistics{
+		HashMatch: hash == downloadHash,
+		Size:      size,
+		Upload:    uploadDur,
+		Download:  downloadDur,
+	}, nil
+}
+
+func findNode() (string, error) {
+	cl := MustExplorer(ExplorerURL)
+	nodes, err := cl.Nodes(IsUp(), IsPublic())
+	if err != nil {
+		return "", err
+	}
+	if len(nodes) == 0 {
+		return "", fmt.Errorf("no public nodes found")
+	}
+	Shuffle(nodes)
+	return nodes[0].ID, nil
 }
 
 func main() {
+	/*
+		Process:
+		 - Make a new user
+		 - We first to need to know which node we need to test. do the following
+		  = Deploy a network on that remote node
+		  = Apply wireguard configuration
+		  = Start wireguard
+		   * make sure wireguard config are deleted afterwards
+		 - deploy 3 zdbs on random? nodes (or may be specified via command line)
+		 - deploy a storage volume
+		 - deploy container
+
+		 - run minio upload/download and measure speed. (may be run minio mint)
+		 - clean up
+	*/
 	var (
 		tfBin string
 		mcBin string
@@ -460,9 +498,15 @@ func main() {
 		MCBin, _ = filepath.Abs(mcBin)
 	}
 
+	var err error
 	if len(node) == 0 {
-		log.Fatal().Msg("-node is required")
+		node, err = findNode()
+		if err != nil {
+			log.Fatal().Err(err).Msg("failed to find node")
+		}
 	}
+
+	log.Info().Str("node", node).Msg("using node")
 
 	root, err := ioutil.TempDir("", "minio-perf")
 	if err != nil {
@@ -475,8 +519,9 @@ func main() {
 		}
 	}()
 
-	if cwd, err := os.Getwd(); err == nil {
-		defer os.Chdir(cwd)
+	cwd, err := os.Getwd()
+	if err != nil {
+		log.Error().Err(err).Msg("failed to get cwd of the process")
 	}
 
 	log.Info().Str("root", root).Msg("chainging into test root")
@@ -485,22 +530,21 @@ func main() {
 		log.Fatal().Str("root", root).Err(err).Msg("failed to change directory")
 	}
 
-	if err := run(node); err != nil {
+	stats, err := run(node)
+	if err != nil {
 		log.Fatal().Err(err).Msg("failed to execute tests")
 	}
-	/*
-		Process:
-		 - Make a new user
-		 - We first to need to know which node we need to test. do the following
-		  = Deploy a network on that remote node
-		  = Apply wireguard configuration
-		  = Start wireguard
-		   * make sure wireguard config are deleted afterwards
-		 - deploy 3 zdbs on random? nodes (or may be specified via command line)
-		 - deploy a storage volume
-		 - deploy container
 
-		 - run minio upload/download and measure speed. (may be run minio mint)
-		 - clean up
-	*/
+	os.Chdir(cwd)
+	output, err := os.Create("statistics.json")
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to create statistics file")
+	}
+
+	defer output.Close()
+	enc := json.NewEncoder(output)
+	for _, st := range stats {
+		enc.Encode(st)
+		output.WriteString("\n")
+	}
 }

@@ -1,7 +1,7 @@
 all: build
 
 test: build
-	sudo ./minio-perf -node $(NODE) -mc $(MC) -tfuser $(TFUSER)
+	sudo ./minio-perf -mc $(MC) -tfuser $(TFUSER)
 build:
 	go build
 
