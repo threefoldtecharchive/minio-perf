@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -458,7 +459,10 @@ func findNode() (string, error) {
 	if len(nodes) == 0 {
 		return "", fmt.Errorf("no public nodes found")
 	}
+
+	log.Debug().Int("nodes", len(nodes)).Msg("found public nodes")
 	Shuffle(nodes)
+
 	return nodes[0].ID, nil
 }
 
@@ -478,6 +482,7 @@ func main() {
 		 - run minio upload/download and measure speed. (may be run minio mint)
 		 - clean up
 	*/
+	rand.Seed(time.Now().Unix())
 	var (
 		tfBin string
 		mcBin string
