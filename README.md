@@ -14,3 +14,20 @@ make
 ```bash
 sudo ./minio-perf -node $(NODE) -mc $(MC) -tfuser $(TFUSER)
 ```
+
+## Usage
+```bash
+# ./minio-perf --help
+flag provided but not defined: -hel
+Usage of ./minio-perf:
+  -dist string
+    	distribution of data/party bit in format of Data/Parity (default "2/1")
+  -mc string
+    	path to mc binary. Default to using $PATH
+  -node string
+    	node to install minio. It must have public interface
+  -tfuser string
+    	path to tfuser binary. Default to using $PATH
+  -zdbs int
+    	number of zdb namespaces to deploy (default 3)
+```
