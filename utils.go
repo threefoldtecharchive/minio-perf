@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"os"
 	"os/exec"
 	"strings"
+	"time"
 
+	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
 )
 
 // R is a utility to quickly write output of tfuser command to a file
@@ -24,25 +28,6 @@ func (o R) Redirect(s string, err error) error {
 	return ioutil.WriteFile(string(o), []byte(s), 0644)
 }
 
-// D is an alias for func() to be used as clean up method
-// usually as `defer d.Defer()`
-type D func()
-
-// Defer runs this D object, does nothing if d is nil
-func (d D) Defer() {
-	if d != nil {
-		d()
-	}
-}
-
-// Then return a new D that when called first calls d, then n
-func (d D) Then(n D) D {
-	return func() {
-		d.Defer()
-		n.Defer()
-	}
-}
-
 func cmd(c string, args ...string) (string, error) {
 	out, err := exec.Command(c, args...).Output()
 	if err != nil {
@@ -52,14 +37,57 @@ func cmd(c string, args ...string) (string, error) {
 	return string(out), nil
 }
 
-func tfuser(args ...string) (string, error) {
-	return cmd(TFUserBin, args...)
+type App struct {
+	Node       string
+	ZDBs       int
+	DataParity string
+	TFUserBin  string
+	MCBin      string
 }
 
-func provision(schema, node string) (Resource, error) {
+func (a *App) Distribution() (d int, p int, err error) {
+	if _, err := fmt.Sscanf(a.DataParity, "%d/%d", &d, &p); err != nil {
+		return d, p, errors.Wrap(err, "invalid data parity format expecting D/D")
+	}
+	if d == 0 || p == 0 {
+		return d, p, fmt.Errorf("data nor parity can be zero")
+	}
+	return
+}
+
+func (a *App) TFUser(args ...string) (string, error) {
+	return cmd(a.TFUserBin, args...)
+}
+
+func (a *App) MC(args ...string) (time.Duration, error) {
+	notify := func(err error, d time.Duration) {
+		log.Info().Err(err).Dur("duration", d).Msg(strings.Join(args, " "))
+	}
+
+	exp := backoff.NewExponentialBackOff()
+	exp.MaxInterval = 10 * time.Second
+	boff := backoff.WithMaxRetries(exp, 10)
+	var d time.Duration
+	err := backoff.RetryNotify(func() error {
+		cmd := exec.Command(a.MCBin, args...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		t := time.Now()
+
+		err := cmd.Run()
+		d = time.Since(t)
+		return err
+
+	}, boff, notify)
+
+	return d, err
+}
+
+func (a *App) Provision(schema, node string) (Resource, error) {
 
 	// provision network
-	out, err := tfuser(
+	out, err := a.TFUser(
 		"provision",
 		"--schema", schema,
 		"--duration", ProvisionDuration,
@@ -85,9 +113,9 @@ func provision(schema, node string) (Resource, error) {
 	return "", fmt.Errorf("failed to extract resource URI from reservation (%s):\n%s", schema, out)
 }
 
-func deProvision(rs ...Resource) error {
+func (a *App) DeProvision(rs ...Resource) error {
 	for _, r := range rs {
-		_, err := tfuser(
+		_, err := a.TFUser(
 			"delete",
 			"--id", r.ID(),
 		)
@@ -99,7 +127,7 @@ func deProvision(rs ...Resource) error {
 	return nil
 }
 
-func mkTestFile(sizeMB int64) (hash string, path string, err error) {
+func MkTestFile(sizeMB int64) (hash string, path string, err error) {
 	file, err := ioutil.TempFile(".", fmt.Sprintf("random-%dMB-", sizeMB))
 	if err != nil {
 		return hash, path, err

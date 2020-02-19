@@ -1,18 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/cenkalti/backoff/v3"
 	"github.com/pkg/errors"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -34,13 +33,6 @@ const (
 	MinioIP = "172.10.1.100"
 )
 
-var (
-	// TFUserBin binary
-	TFUserBin string = "tfuser"
-	// MCBin binary
-	MCBin string = "mc"
-)
-
 func init() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{
 		TimeFormat: time.RFC3339,
@@ -49,17 +41,17 @@ func init() {
 
 }
 
-func mkUser() error {
-	_, err := tfuser("id")
+func mkUser(app *App) error {
+	_, err := app.TFUser("id")
 	return err
 }
 
-func mkNetwork(node string) (D, error) {
+func mkNetwork(ctx context.Context, app *App) error {
 	const (
 		schema = "network.json"
 	)
 
-	err := R(schema).Redirect(tfuser(
+	err := R(schema).Redirect(app.TFUser(
 		"gen",
 		"network",
 		"create",
@@ -68,65 +60,65 @@ func mkNetwork(node string) (D, error) {
 	))
 
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create network schema")
+		return errors.Wrap(err, "failed to create network schema")
 	}
 
 	// add node
-	_, err = tfuser(
+	_, err = app.TFUser(
 		"gen",
 		"--schema", schema,
 		"network",
 		"add-node",
-		"--node", node,
+		"--node", app.Node,
 		"--subnet", Subnet,
 	)
 
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to add node to network")
+		return errors.Wrap(err, "failed to add node to network")
 	}
 
 	// add access
 	err = R("/etc/wireguard/miniotest.conf").Redirect(
-		tfuser(
+		app.TFUser(
 			"gen",
 			"--schema", schema,
 			"network",
 			"add-access",
-			"--node", node,
+			"--node", app.Node,
 			"--subnet", "10.1.0.0/24",
 			"--ip4", //TODO: do we need this ?
 		),
 	)
 
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to add access to network")
+		return errors.Wrap(err, "failed to add access to network")
 	}
 
-	resource, err := provision(schema, node)
+	resource, err := app.Provision(schema, app.Node)
 
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to provision network")
+		return errors.Wrap(err, "failed to provision network")
 	}
 
-	d := D(func() {
+	AddDestructor(ctx, func() {
 		log.Debug().Str("resource", resource.ID()).Msg("de-provision network")
-		if err := deProvision(resource); err != nil {
+		if err := app.DeProvision(resource); err != nil {
 			log.Error().Err(err).Msg("failed to de-provision network")
 		}
 	})
 
 	wg, err := cmd("wg-quick", "up", "miniotest")
 	if err != nil {
-		return d, errors.Wrapf(err, "failed to bring wg interface up: %s", wg)
+		return errors.Wrapf(err, "failed to bring wg interface up: %s", wg)
 	}
 
-	d = d.Then(func() {
+	AddDestructor(ctx, func() {
 		if _, err := cmd("wg-quick", "down", "miniotest"); err != nil {
 			log.Error().Err(err).Msg("failed to clean up wireguard setup")
 		}
 	})
 
-	return d, nil
+	return nil
 }
 
 // ZDB result object
@@ -150,9 +142,9 @@ func (z *ZDB) String() string {
 type ZDBs []ZDB
 
 // Clean clean zdbs
-func (zs ZDBs) Clean() {
+func (zs ZDBs) Clean(app *App) {
 	for _, zdb := range zs {
-		if err := deProvision(zdb.Resource()); err != nil {
+		if err := app.DeProvision(zdb.Resource()); err != nil {
 			log.Error().Err(err).Str("reservation", zdb.Resource().ID()).Msg("failed to delete reservation")
 		}
 	}
@@ -170,15 +162,15 @@ func (zs ZDBs) String() string {
 	return buf.String()
 }
 
-func mkZdb(n int) (zdbs ZDBs, err error) {
+func mkZdb(ctx context.Context, app *App) (zdbs ZDBs, err error) {
 	cl := MustExplorer(ExplorerURL)
 	nodes, err := cl.Nodes(IsUp(), WithSRU(10))
 
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to list nodes from explorer")
 	}
-	if len(nodes) < n {
-		return nil, fmt.Errorf("number of online nodes is not sufficient (required at least: %d", n)
+	if len(nodes) < app.ZDBs {
+		return nil, fmt.Errorf("number of online nodes is not sufficient (required at least: %d", app.ZDBs)
 	}
 
 	const (
@@ -186,7 +178,7 @@ func mkZdb(n int) (zdbs ZDBs, err error) {
 	)
 
 	err = R("zdb.json").Redirect(
-		tfuser(
+		app.TFUser(
 			"generate",
 			"storage",
 			"zdb",
@@ -207,13 +199,13 @@ func mkZdb(n int) (zdbs ZDBs, err error) {
 
 	defer func() {
 		if err != nil {
-			deProvision(resources...)
+			app.DeProvision(resources...)
 		}
 	}()
 
-	for i := 0; i < n; i++ {
+	for i := 0; i < app.ZDBs; i++ {
 		var resource Resource
-		resource, err = provision("zdb.json", nodes[i].ID)
+		resource, err = app.Provision("zdb.json", nodes[i].ID)
 		if err != nil {
 			return nil, err
 		}
@@ -240,24 +232,28 @@ func mkZdb(n int) (zdbs ZDBs, err error) {
 		zdbs = append(zdbs, zdb)
 	}
 
-	// TODO: wait for resources to finish deployment
 	return zdbs, nil
 }
 
-func mkMinio(node string, zdbs ZDBs) (D, error) {
+func mkMinio(ctx context.Context, app *App, zdbs ZDBs) error {
 	const (
 		flist = "https://hub.grid.tf/azmy.3bot/minio.flist"
 	)
 
+	data, parity, err := app.Distribution()
+	if err != nil {
+		return err
+	}
+
 	R("container.json").Redirect(
-		tfuser(
+		app.TFUser(
 			"generate",
 			"container",
 			"--flist", flist,
 			"--entrypoint", "/bin/entrypoint",
 			"--envs", fmt.Sprintf("SHARDS=%s", zdbs.String()),
-			"--envs", "DATA=2",
-			"--envs", "PARITY=1",
+			"--envs", fmt.Sprintf("DATA=%d", data),
+			"--envs", fmt.Sprintf("PARITY=%d", parity),
 			"--envs", "ACCESS_KEY=minio",
 			"--envs", "SECRET_KEY=passwordpassword",
 			"--cpu", "2",
@@ -267,84 +263,57 @@ func mkMinio(node string, zdbs ZDBs) (D, error) {
 		),
 	)
 
-	resource, err := provision("container.json", node)
+	resource, err := app.Provision("container.json", app.Node)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	d := D(func() {
-		if err := deProvision(resource); err != nil {
+	cleanUp := func() {
+		if err := app.DeProvision(resource); err != nil {
 			log.Error().Err(err).Msg("failed to de-provision minio container")
 		}
-	})
+	}
+	AddDestructor(ctx, cleanUp)
 
 	cl := MustExplorer(ExplorerURL)
 	_, err = cl.Wait(resource)
 	if err != nil {
-		d.Defer()
-		return nil, err
+		cleanUp()
+		return err
 	}
 
-	return d, nil
+	return nil
 }
 
-func run(node string) ([]Statistics, error) {
+func run(app *App) ([]Statistics, error) {
+	ctx, cancel := WithDestructor(context.Background())
+	defer cancel()
+
 	// - Make use seed file.
-	if err := mkUser(); err != nil {
+	if err := mkUser(app); err != nil {
 		return nil, errors.Wrap(err, "failed to create user")
 	}
 
 	// - Make network and provision it.
-	dNetwork, err := mkNetwork(node)
+	err := mkNetwork(ctx, app)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create network")
 	}
 
-	defer dNetwork.Defer()
-
-	zdbs, err := mkZdb(3)
+	zdbs, err := mkZdb(ctx, app)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to deploy zdbs")
 	}
 
-	defer zdbs.Clean()
-
-	dMinio, err := mkMinio(node, zdbs)
+	err = mkMinio(ctx, app, zdbs)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to deploy minio")
 	}
 
-	defer dMinio.Defer()
-
-	return test()
+	return test(app)
 }
 
-func mc(args ...string) (time.Duration, error) {
-	notify := func(err error, d time.Duration) {
-		log.Info().Err(err).Dur("duration", d).Msg(strings.Join(args, " "))
-	}
-
-	exp := backoff.NewExponentialBackOff()
-	exp.MaxInterval = 10 * time.Second
-	boff := backoff.WithMaxRetries(exp, 10)
-	var d time.Duration
-	err := backoff.RetryNotify(func() error {
-		cmd := exec.Command(MCBin, args...)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		t := time.Now()
-
-		err := cmd.Run()
-		d = time.Since(t)
-		return err
-
-	}, boff, notify)
-
-	return d, err
-}
-
-func test() ([]Statistics, error) {
+func test(app *App) ([]Statistics, error) {
 	const (
 		configDir = "mc"
 	)
@@ -375,13 +344,13 @@ func test() ([]Statistics, error) {
 		bucket = "test/bucket"
 	)
 
-	if _, err := mc("-C", configDir, "mb", bucket); err != nil {
+	if _, err := app.MC("-C", configDir, "mb", bucket); err != nil {
 		return nil, err
 	}
 
 	var statistics []Statistics
 	for _, size := range []int64{10, 100, 1024} {
-		stats, err := uploadTest(configDir, bucket, size)
+		stats, err := uploadTest(app, configDir, bucket, size)
 		if err != nil {
 			log.Error().Err(err).Msgf("error while testing %dmb file upload", size)
 		}
@@ -399,8 +368,8 @@ type Statistics struct {
 	Download  time.Duration `json:"download-ns"`
 }
 
-func uploadTest(config, bucket string, size int64) (*Statistics, error) {
-	hash, name, err := mkTestFile(size)
+func uploadTest(app *App, config, bucket string, size int64) (*Statistics, error) {
+	hash, name, err := MkTestFile(size)
 	if err != nil {
 		return nil, err
 	}
@@ -408,7 +377,7 @@ func uploadTest(config, bucket string, size int64) (*Statistics, error) {
 	log := log.With().Int64("size-mb", size).Str("file", name).Str("hash", hash).Logger()
 	log.Info().Msg("uploading file")
 
-	uploadDur, err := mc(
+	uploadDur, err := app.MC(
 		"-C", config,
 		"cp", name, bucket,
 	)
@@ -420,7 +389,7 @@ func uploadTest(config, bucket string, size int64) (*Statistics, error) {
 	log.Info().Str("duration", uploadDur.String()).Msg("uploading time")
 
 	downloadName := fmt.Sprintf("%s.download", name)
-	downloadDur, err := mc(
+	downloadDur, err := app.MC(
 		"-C", config,
 		"cp", filepath.Join(bucket, name), downloadName,
 	)
@@ -483,35 +452,36 @@ func main() {
 		 - clean up
 	*/
 	rand.Seed(time.Now().Unix())
-	var (
-		tfBin string
-		mcBin string
-		node  string
-	)
+	var app App
 
-	flag.StringVar(&tfBin, "tfuser", "", "path to tfuser binary. Default to using $PATH")
-	flag.StringVar(&mcBin, "mc", "", "path to mc binary. Default to using $PATH")
-	flag.StringVar(&node, "node", "", "node to install minio. It must have public interface")
-
+	flag.StringVar(&app.TFUserBin, "tfuser", "", "path to tfuser binary. Default to using $PATH")
+	flag.StringVar(&app.MCBin, "mc", "", "path to mc binary. Default to using $PATH")
+	flag.StringVar(&app.Node, "node", "", "node to install minio. It must have public interface")
+	flag.IntVar(&app.ZDBs, "zdbs", 3, "number of zdb namespaces to deploy")
+	flag.StringVar(&app.DataParity, "dist", "2/1", "distribution of data/party bit in format of Data/Parity")
 	flag.Parse()
 
-	if len(tfBin) != 0 {
-		TFUserBin, _ = filepath.Abs(tfBin)
+	if len(app.TFUserBin) != 0 {
+		app.TFUserBin, _ = filepath.Abs(app.TFUserBin)
 	}
 
-	if len(mcBin) != 0 {
-		MCBin, _ = filepath.Abs(mcBin)
+	if len(app.MCBin) != 0 {
+		app.MCBin, _ = filepath.Abs(app.MCBin)
+	}
+
+	if _, _, err := app.Distribution(); err != nil {
+		log.Fatal().Err(err).Msg("failed to parse data/parity information")
 	}
 
 	var err error
-	if len(node) == 0 {
-		node, err = findNode()
+	if len(app.Node) == 0 {
+		app.Node, err = findNode()
 		if err != nil {
 			log.Fatal().Err(err).Msg("failed to find node")
 		}
 	}
 
-	log.Info().Str("node", node).Msg("using node")
+	log.Info().Str("node", app.Node).Msg("using node")
 
 	root, err := ioutil.TempDir("", "minio-perf")
 	if err != nil {
@@ -535,7 +505,7 @@ func main() {
 		log.Fatal().Str("root", root).Err(err).Msg("failed to change directory")
 	}
 
-	stats, err := run(node)
+	stats, err := run(&app)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to execute tests")
 	}
